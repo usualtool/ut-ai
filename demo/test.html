@@ -4,13 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>UT-AI智能助手</title>
-    <link rel="stylesheet" href="//frame.usualtool.com/assets/css/bootstrap.min.css">
-    <link rel="stylesheet" href="//frame.usualtool.com/assets/css/ai.css">
-    <link rel="stylesheet" href="//cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
-    <script src="//cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="//cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-    <script src="//frame.usualtool.com/baike/assets/js/md5.js"></script>
-    <script src="//frame.usualtool.com/baike/assets/js/time.js"></script>
+    <link rel="stylesheet" href="//www.usualtool.com/ai/css/bootstrap.min.css">
+    <link rel="stylesheet" href="//www.usualtool.com/ai/css/robot.css?v=1.5">
+    <link rel="stylesheet" href="//www.usualtool.com/ai/css/github.min.css">
+    <script src="//www.usualtool.com/ai/js/marked.min.js"></script>
+    <script src="//www.usualtool.com/ai/js/highlight.min.js"></script>
+    <script src="//www.usualtool.com/ai/js/md5.js"></script>
+    <script src="//www.usualtool.com/ai/js/time.js"></script>
 </head>
 <body>
     <div class="chat-container" id="chatContainer">
@@ -24,7 +24,7 @@
             </div>
         </div>
     </div>
-    <script src="//frame.usualtool.com/assets/js/jquery.min.js"></script>
+    <script src="//www.usualtool.com/ai/js/jquery.min.js"></script>
     <script>
         //请在/vendor/usualtool/ut-ai/src/.env中进行初始设置
         const chatContainer = document.getElementById('chatContainer');
@@ -53,7 +53,7 @@
             if (fenceCount % 2 !== 0) { text += '\n\x60\x60\x60'; }
             const inlineCodeCount = (text.match(/`/g) || []).length;
             if (inlineCodeCount % 2 !== 0) { text += '`'; }
-            const openTags = ['<table', '<ul', '<ol', '<div'];
+            const openTags = ['<table', '<ul', '<ol', '<div>'];
             const closeTags = ['</table>', '</ul>', '</ol>', '</div>'];
             for (let i = 0; i < openTags.length; i++) {
                 const openCount = (text.match(new RegExp(openTags[i], 'gi')) || []).length;
@@ -62,6 +62,7 @@
             }
             return marked.parse(text);
         }
+        let currentSessionId = localStorage.getItem('chatSessionId') || '';
         async function sendMessage() {
             const text = userInput.value.trim();
             if (!text) return;
@@ -107,12 +108,13 @@
                     headers: {
                         'Content-Type': 'application/json',
                         'time': getnowdate(),
-                        'token': md5("ut-api应用ApiKey"+gettimestamp())//ApiKey通过可视包/dev/ut-api查看
+                        'token': md5("apikey" + gettimestamp())//通过/dev/ut-api获取
                     },
                     body: JSON.stringify({
-                        model: 'glm-5v-turbo',//选用模型需在/vendor/usualtool/ut-ai/src/.env模型范围内
+                        model: 'glm-5v-turbo',//需在.env模型配置列表中
                         messages: [{ role: 'user', content: text }],
-                        stream: true
+                        stream: true,
+                        sessionid: currentSessionId
                     })
                 });
                 if (!response.ok) throw new Error('HTTP error! status: ' + response.status);
@@ -132,6 +134,10 @@
                         if (jsonStr === '[DONE]') continue;
                         try {
                             const parsed = JSON.parse(jsonStr);
+                            if (parsed.sessionId) {
+                                currentSessionId = parsed.sessionId;
+                                localStorage.setItem('chatSessionId', currentSessionId);
+                            }
                             if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) {
                                 const delta = parsed.choices[0].delta;
                                 if (delta.reasoning_content) {
@@ -231,7 +237,7 @@
                 btn.className = 'copy-btn';
                 btn.innerText = '复制';
                 btn.onclick = () => {
-                    const code = pre.querySelector('code');
+                    const code = pre.querySelector('.code');
                     navigator.clipboard.writeText(code ? code.innerText : pre.innerText);
                     btn.innerText = '已复制';
                     setTimeout(() => btn.innerText = '复制', 2000);
@@ -239,6 +245,11 @@
                 pre.style.position = 'relative';
                 pre.appendChild(btn);
             });
+        }
+        function clearSession() {
+            localStorage.removeItem('chatSessionId');
+            currentSessionId = '';
+            console.log('会话已清空');
         }
         sendBtn.addEventListener('click', sendMessage);
         userInput.addEventListener('keydown', function(e) {
