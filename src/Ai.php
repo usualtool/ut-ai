@@ -1,5 +1,6 @@
 <?php
 namespace usualtool\Ai;
+use library\UsualToolInc\UTInc;
 class Ai {
     private $UpstreamBaseUrl;
     private $UpstreamApiKey;
@@ -92,7 +93,7 @@ class Ai {
      * @param array $options 其他可选参数
      * @return string 返回 JSON 字符串
      */
-    public function Chat(array $messages, string $model = '', bool $stream = false, array $options = []) {
+    public function Chat(array $messages, string $model = '', bool $stream = false, string $sessionId='', array $options = []) {
         if (empty($messages)) {
             return json_encode(['error' => ['message' => '缺少 messages 参数']]);
         }
@@ -120,10 +121,10 @@ class Ai {
             ];
         }
         if ($stream) {
-            $this->StreamProxy($url, $body, $useKnowledge);
+            $this->StreamProxy($url, $body, $useKnowledge, $sessionId);
             return '';
         } else {
-            return $this->NormalProxy($url, $body, $useKnowledge);
+            return $this->NormalProxy($url, $body, $useKnowledge, $sessionId);
         }
     }
     /**
@@ -196,8 +197,8 @@ class Ai {
         }
         return $input;
     }
-    private function NormalProxy(string $url, array $body, bool $useKnowledge = false): string {
-        $ch = $this->InitCurl($url, $body, $useKnowledge);
+    private function NormalProxy(string $url, array $body, bool $useKnowledge = false, string $sessionId=''): string {
+        $ch = $this->InitCurl($url, $body, $useKnowledge,$sessionId);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         $response = curl_exec($ch);
         $error = curl_error($ch);
@@ -210,7 +211,7 @@ class Ai {
     /**
      * 流式代理转发
      */
-    private function StreamProxy(string $url, array $body, bool $useKnowledge = false) {
+    private function StreamProxy(string $url, array $body, bool $useKnowledge = false, string $sessionId='') {
         while (ob_get_level()) {
             ob_end_clean();
         }
@@ -218,7 +219,7 @@ class Ai {
         header('Cache-Control: no-cache');
         header('Connection: keep-alive');
         header('X-Accel-Buffering: no');
-        $ch = $this->InitCurl($url, $body, $useKnowledge);
+        $ch = $this->InitCurl($url, $body, $useKnowledge,$sessionId);
         curl_setopt($ch, CURLOPT_TIMEOUT, 120);
         $responseId = 'chatcmpl-' . uniqid();
         $finalUsage = null;
@@ -236,8 +237,13 @@ class Ai {
                         if ($jsonStr === '[DONE]') continue;
                         $event = json_decode($jsonStr, true);
                         if (!$event || !isset($event['type'])) continue;
+                        static $currentSessionId = '';
+                        if (isset($event['sessionId']) && !empty($event['sessionId'])) {
+                            $currentSessionId = $event['sessionId'];
+                        }
                         $standardData = [
                             'id' => $responseId,
+                            'sessionId' => $currentSessionId,
                             'object' => 'chat.completion.chunk',
                             'created' => time(),
                             'model' => $this->KnowledgeModel,
@@ -310,16 +316,20 @@ class Ai {
             flush();
         }
     }
-    private function InitCurl(string $url, array $body, bool $useKnowledge = false) {
+    private function InitCurl(string $url, array $body, bool $useKnowledge = false, string $sessionId='') {
         $ch = curl_init($url);
         $apiKey = ($useKnowledge && !empty($this->KnowledgeApiKey)) ? $this->KnowledgeApiKey : $this->UpstreamApiKey;
+        $headers = [
+            'Content-Type: application/json',
+            'Authorization: Bearer '.$apiKey,
+        ];
+        if(!empty($sessionId)){
+            $headers[] = 'X-Session-Id: '.$sessionId;
+        }
         curl_setopt_array($ch, [
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => json_encode($body),
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
-                'Authorization: Bearer ' . $apiKey,
-            ],
+            CURLOPT_HTTPHEADER => $headers,
             CURLOPT_TIMEOUT => 300,
         ]);
         return $ch;
