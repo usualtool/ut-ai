@@ -1,6 +1,5 @@
 <?php
 namespace usualtool\Ai;
-use library\UsualToolInc\UTInc;
 class Ai {
     private $UpstreamBaseUrl;
     private $UpstreamApiKey;
