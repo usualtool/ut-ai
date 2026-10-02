@@ -15,6 +15,7 @@ class Ai {
     private $KnowledgeModel;
     private $EnableThinking;
     private $KnowledgeEnableThinking;
+    private $SystemPrompt;
     /**
      * 构造函数：初始化配置
      * @param array $config 配置数组
@@ -35,6 +36,7 @@ class Ai {
             $this->KnowledgeModel = $config['knowledge_model'] ?? '';
             $this->EnableThinking = !empty($config['enable_thinking']);
             $this->KnowledgeEnableThinking = !empty($config['knowledge_enable_thinking']);
+            $this->SystemPrompt = $this->ParsePrompt($config['system_prompt'] ?? '');
         } else {
             $this->LoadEnvConfig();
         }
@@ -68,6 +70,32 @@ class Ai {
         $this->KnowledgeModel = $env['KNOWLEDGE_MODEL'] ?? '';
         $this->EnableThinking = !empty($env['ENABLE_THINKING']);
         $this->KnowledgeEnableThinking = !empty($env['KNOWLEDGE_ENABLE_THINKING']);
+        $this->SystemPrompt = $this->ParsePrompt($env['SYSTEM_PROMPT'] ?? '');
+    }
+    /**
+     * 解析提示词配置
+     * @param mixed $value
+     * @return string
+     */
+    private function ParsePrompt($value): string {
+        $value = (string)$value;
+        if ($value === '') {
+            return '';
+        }
+        return str_replace(array('\n', '\r'), array("\n", ''), trim($value));
+    }
+    /**
+     * 消息数组中是否已有 system 消息
+     * @param array $messages
+     * @return bool
+     */
+    private function HasSystemMessage(array $messages): bool {
+        foreach ($messages as $msg) {
+            if (isset($msg['role']) && $msg['role'] === 'system') {
+                return true;
+            }
+        }
+        return false;
     }
     /**
      * 处理请求
@@ -102,6 +130,23 @@ class Ai {
         if (!in_array($model, $this->AllowedModels)) {
             return json_encode(['error' => ['message' => '不支持的模型：' . $model]]);
         }
+        list($url, $body, $useKnowledge) = $this->BuildChatRequest($messages, $model, $stream, $options);
+        if ($stream) {
+            $this->StreamProxy($url, $body, $useKnowledge, $sessionId);
+            return '';
+        } else {
+            return $this->NormalProxy($url, $body, $useKnowledge, $sessionId);
+        }
+    }
+    /**
+     * 构建上游请求
+     * @param array $messages 消息数组
+     * @param string $model 模型名称
+     * @param bool $stream 是否流式
+     * @param array $options 其他可选参数
+     * @return array array($url, $body, $useKnowledge)
+     */
+    private function BuildChatRequest(array $messages, string $model, bool $stream, array $options = []): array {
         $body = array_merge([
             'model' => $model,
             'messages' => $this->NormalizeMessages($messages),
@@ -119,12 +164,194 @@ class Ai {
                 'type' => $this->EnableThinking ? 'enabled' : 'disabled'
             ];
         }
-        if ($stream) {
-            $this->StreamProxy($url, $body, $useKnowledge, $sessionId);
-            return '';
-        } else {
-            return $this->NormalProxy($url, $body, $useKnowledge, $sessionId);
+        if (trim($this->SystemPrompt) !== '' && !$this->HasSystemMessage($body['messages'])) {
+            array_unshift($body['messages'], [
+                'role' => 'system',
+                'content' => $this->SystemPrompt,
+            ]);
         }
+        return [$url, $body, $useKnowledge];
+    }
+    /**
+     * 命令行流式对话
+     * @param array $messages 消息数组（末条为本次提问）
+     * @param string $model 模型名称
+     * @param callable|null $callback 回调函数
+     * @param string $sessionId 会话ID（透传上游 X-Session-Id）
+     * @param array $options 其他可选参数
+     * @return void
+     */
+    public function Cli(array $messages, string $model = '', ?callable $callback = null, string $sessionId = '', array $options = []){
+        $emit = function ($type, $text, $usage = []) use ($callback) {
+            if ($callback !== null) {
+                call_user_func($callback, $type, $this->ToText($text), is_array($usage) ? $usage : []);
+            }
+        };
+        if (empty($messages)) {
+            $emit('error', '缺少 messages 参数');
+            $emit('done', '', []);
+            return;
+        }
+        if (empty($model)) {
+            $model = $this->AllowedModels[0] ?? 'glm-4-flash';
+        }
+        if (!in_array($model, $this->AllowedModels)) {
+            $emit('error', '不支持的模型：' . $model);
+            $emit('done', '', []);
+            return;
+        }
+        list($url, $body, $useKnowledge) = $this->BuildChatRequest($messages, $model, true, $options);
+        $base = $useKnowledge ? $this->KnowledgeBaseUrl : $this->UpstreamBaseUrl;
+        $apiKey = ($useKnowledge && !empty($this->KnowledgeApiKey)) ? $this->KnowledgeApiKey : $this->UpstreamApiKey;
+        if (trim((string)$base) === '') {
+            $emit('error', '上游地址为空，请检查 UPSTREAM_BASE_URL'
+                . ($useKnowledge ? ' / KNOWLEDGE_BASE_URL' : ''));
+            $emit('done', '', []);
+            return;
+        }
+        if ((string)$apiKey === '') {
+            $emit('error', '上游密钥为空，请检查 UPSTREAM_API_KEY'
+                . ($useKnowledge ? ' / KNOWLEDGE_API_KEY' : ''));
+            $emit('done', '', []);
+            return;
+        }
+        $payload = json_encode($body, JSON_UNESCAPED_UNICODE);
+        if ($payload === false) {
+            $emit('error', '请求体编码失败（' . json_last_error_msg() . '）');
+            $emit('done', '', []);
+            return;
+        }
+        $buffer = '';
+        $plain = '';
+        $usage = [];
+        $got = false;
+        $onLine = function ($line) use ($emit, $useKnowledge, &$plain, &$usage, &$got) {
+            $line = trim($line);
+            if ($line === '') {
+                return;
+            }
+            if (stripos($line, 'data:') !== 0) {
+                $plain .= $line . "\n";
+                return;
+            }
+            $raw = trim(substr($line, 5));
+            if ($raw === '' || $raw === '[DONE]') {
+                return;
+            }
+            $event = json_decode($raw, true);
+            if (!is_array($event)) {
+                $plain .= $line . "\n";
+                return;
+            }
+            if (isset($event['error'])) {
+                $got = true;
+                $e = $event['error'];
+                if (is_array($e)) {
+                    $emit('error', isset($e['message']) ? $e['message'] : json_encode($e, JSON_UNESCAPED_UNICODE));
+                } else {
+                    $emit('error', $e);
+                }
+                return;
+            }
+            if (isset($event['usage']) && is_array($event['usage']) && !empty($event['usage'])) {
+                $usage = $event['usage'];
+            }
+            if ($useKnowledge && isset($event['type'])) {
+                switch ($event['type']) {
+                    case 'thought':
+                    case 'reasoning':
+                        if (!$this->KnowledgeEnableThinking) {
+                            break;
+                        }
+                        if (isset($event['data']) && $this->ToText($event['data']) !== '') {
+                            $got = true;
+                            $emit('reasoning', $event['data']);
+                        }
+                        break;
+                    case 'answer':
+                        if (isset($event['data']) && $this->ToText($event['data']) !== '') {
+                            $got = true;
+                            $emit('content', $event['data']);
+                        }
+                        break;
+                    case 'done':
+                        if (isset($event['usage']) && is_array($event['usage'])) {
+                            $usage = $event['usage'];
+                        }
+                        break;
+                }
+                return;
+            }
+            if (!isset($event['choices'][0]['delta']) || !is_array($event['choices'][0]['delta'])) {
+                return;
+            }
+            $delta = $event['choices'][0]['delta'];
+            if (isset($delta['reasoning_content']) && $this->ToText($delta['reasoning_content']) !== '') {
+                $got = true;
+                $emit('reasoning', $delta['reasoning_content']);
+            }
+            if (isset($delta['content']) && $this->ToText($delta['content']) !== '') {
+                $got = true;
+                $emit('content', $delta['content']);
+            }
+        };
+        $headers = [
+            'Content-Type: application/json',
+            'Accept: text/event-stream',
+            'Authorization: Bearer ' . $apiKey,
+        ];
+        if (!empty($sessionId)) {
+            $headers[] = 'X-Session-Id: ' . $sessionId;
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_TIMEOUT => 300,
+            CURLOPT_WRITEFUNCTION => function ($ch, $chunk) use (&$buffer, $onLine) {
+                $buffer .= $chunk;
+                while (($pos = strpos($buffer, "\n")) !== false) {
+                    $line = str_replace("\r", '', substr($buffer, 0, $pos));
+                    $buffer = substr($buffer, $pos + 1);
+                    $onLine($line);
+                }
+                return strlen($chunk);
+            },
+        ]);
+        curl_exec($ch);
+        $error = curl_error($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($buffer !== '') {
+            $rest = $buffer;
+            $buffer = '';
+            $onLine($rest);
+        }
+        if ($error !== '') {
+            $got = true;
+            $emit('error', '上游请求失败：' . $error);
+        } elseif (!$got && trim($plain) !== '') {
+            $emit('error', '上游返回 HTTP ' . $httpCode . '：' . substr(trim($plain), 0, 300));
+        } elseif (!$got) {
+            $emit('error', '上游未返回任何内容');
+        }
+        $emit('done', '', $usage);
+    }
+    /**
+     * 把帧内容统一成字符串
+     * @param mixed $value
+     * @return string
+     */
+    private function ToText($value): string {
+        if (is_string($value)) {
+            return $value;
+        }
+        if (is_scalar($value) || $value === null) {
+            return (string)$value;
+        }
+        $json = json_encode($value, JSON_UNESCAPED_UNICODE);
+        return $json === false ? '' : $json;
     }
     /**
      * 获取可用模型列表
