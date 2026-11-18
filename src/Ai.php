@@ -16,6 +16,10 @@ class Ai {
     private $EnableThinking;
     private $KnowledgeEnableThinking;
     private $SystemPrompt;
+    private $ImageModel;
+    private $ImageSize;
+    private $ImageBaseUrl;
+    private $ImageApiKey;
     /**
      * 构造函数：初始化配置
      * @param array $config 配置数组
@@ -37,6 +41,10 @@ class Ai {
             $this->EnableThinking = !empty($config['enable_thinking']);
             $this->KnowledgeEnableThinking = !empty($config['knowledge_enable_thinking']);
             $this->SystemPrompt = $this->ParsePrompt($config['system_prompt'] ?? '');
+            $this->ImageModel = $config['image_model'] ?? 'cogview-3-flash';
+            $this->ImageSize = $config['image_size'] ?? '1024x1024';
+            $this->ImageBaseUrl = $config['image_base_url'] ?? '';
+            $this->ImageApiKey = $config['image_api_key'] ?? '';
         } else {
             $this->LoadEnvConfig();
         }
@@ -71,6 +79,10 @@ class Ai {
         $this->EnableThinking = !empty($env['ENABLE_THINKING']);
         $this->KnowledgeEnableThinking = !empty($env['KNOWLEDGE_ENABLE_THINKING']);
         $this->SystemPrompt = $this->ParsePrompt($env['SYSTEM_PROMPT'] ?? '');
+        $this->ImageModel = $env['IMAGE_MODEL'] ?? 'cogview-3-flash';
+        $this->ImageSize = $env['IMAGE_SIZE'] ?? '1024x1024';
+        $this->ImageBaseUrl = $env['IMAGE_BASE_URL'] ?? '';
+        $this->ImageApiKey = $env['IMAGE_API_KEY'] ?? '';
     }
     /**
      * 解析提示词配置
@@ -106,6 +118,8 @@ class Ai {
         $path = parse_url($uri, PHP_URL_PATH);
         if (preg_match('#/v1/chat/completions$#', $path) && $method === 'POST') {
             $this->HandleChatCompletions();
+        } elseif (preg_match('#/v1/images/generations$#', $path) && $method === 'POST') {
+            $this->HandleImageGenerations();
         } elseif (preg_match('#/v1/models$#', $path) && $method === 'GET') {
             $this->HandleListModels();
         } else {
@@ -137,6 +151,66 @@ class Ai {
         } else {
             return $this->NormalProxy($url, $body, $useKnowledge, $sessionId);
         }
+    }
+    /**
+     * 文生图
+     * @param string $prompt 提示词
+     * @param string $model 模型（留空用 IMAGE_MODEL）
+     * @param array $options 可选参数：size、quality、style、n、response_format、user
+     * @return string 返回 JSON 字符串（data[].url 或 data[].b64_json）
+     */
+    public function Image(string $prompt, string $model = '', array $options = []) {
+        $prompt = trim($prompt);
+        if ($prompt === '') {
+            return json_encode(['error' => ['message' => '缺少 prompt 参数', 'type' => 'invalid_request_error']], JSON_UNESCAPED_UNICODE);
+        }
+        $baseUrl = trim((string)$this->ImageBaseUrl) !== '' ? trim((string)$this->ImageBaseUrl) : trim((string)$this->UpstreamBaseUrl);
+        $apiKey = trim((string)$this->ImageApiKey) !== '' ? trim((string)$this->ImageApiKey) : trim((string)$this->UpstreamApiKey);
+        if ($baseUrl === '') {
+            return json_encode(['error' => ['message' => '生图配置不完整，请检查 IMAGE_BASE_URL / UPSTREAM_BASE_URL', 'type' => 'config_error']], JSON_UNESCAPED_UNICODE);
+        }
+        if ($apiKey === '') {
+            return json_encode(['error' => ['message' => '生图配置不完整，请检查 IMAGE_API_KEY / UPSTREAM_API_KEY', 'type' => 'config_error']], JSON_UNESCAPED_UNICODE);
+        }
+        $body = array_merge([
+            'model' => $model !== '' ? $model : ($this->ImageModel !== '' ? $this->ImageModel : 'cogview-3-flash'),
+            'prompt' => $prompt,
+            'size' => $this->ImageSize !== '' ? $this->ImageSize : '1024x1024',
+        ], array_intersect_key($options, array_flip(['size', 'quality', 'style', 'n', 'response_format', 'user'])));
+        $payload = json_encode($body, JSON_UNESCAPED_UNICODE);
+        if ($payload === false) {
+            return json_encode(['error' => ['message' => '请求体编码失败（' . json_last_error_msg() . '）', 'type' => 'invalid_request_error']], JSON_UNESCAPED_UNICODE);
+        }
+        $url = rtrim($baseUrl, '/') . '/images/generations';
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . $apiKey,
+            ],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 180,
+        ]);
+        $response = curl_exec($ch);
+        $error = curl_error($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($response === false) {
+            return json_encode(['error' => ['message' => '上游请求失败：' . $error, 'type' => 'upstream_error']], JSON_UNESCAPED_UNICODE);
+        }
+        $data = json_decode($response, true);
+        if (!is_array($data)) {
+            return json_encode(['error' => ['message' => '上游返回 HTTP ' . $httpCode . '：' . substr($response, 0, 300), 'type' => 'upstream_error']], JSON_UNESCAPED_UNICODE);
+        }
+        if (isset($data['error'])) {
+            return json_encode($data, JSON_UNESCAPED_UNICODE);
+        }
+        if (empty($data['data'][0]['url']) && empty($data['data'][0]['b64_json'])) {
+            return json_encode(['error' => ['message' => '上游未返回图片数据', 'type' => 'upstream_error']], JSON_UNESCAPED_UNICODE);
+        }
+        return json_encode($data, JSON_UNESCAPED_UNICODE);
     }
     /**
      * 构建上游请求
@@ -406,6 +480,22 @@ class Ai {
             echo $response;
         }
     }
+    private function HandleImageGenerations() {
+
+        $this->Authenticate();
+
+        $input = json_decode(file_get_contents('php://input'), true);
+        if (!is_array($input) || trim((string)($input['prompt'] ?? '')) === '') {
+
+            $this->JsonResponse(400, ['error' => ['message' => '缺少 prompt 参数', 'type' => 'invalid_request_error']]);
+        }
+
+        $options = array_intersect_key($input, array_flip(['size', 'quality', 'style', 'n', 'response_format', 'user']));
+
+        echo $this->Image((string)$input['prompt'], (string)($input['model'] ?? ''), $options);
+
+    }
+
     private function HandleListModels() {
         $this->Authenticate();
         echo $this->ListModels();
